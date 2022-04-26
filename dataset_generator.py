@@ -4,10 +4,12 @@ from PIL import Image, ImageDraw, ImageFont
 import matplotlib.pyplot as plt
 
 
-import nltk
-nltk.download('words')
 
-from nltk.corpus import words
+try:
+    from nltk.corpus import words
+except:
+    import nltk
+    nltk.download('words')
 
 word_list = words.words()
 
@@ -34,8 +36,8 @@ def random_color():
     return tuple(random.randint(0, 255) for _ in range(3))
 
 
-def random_font(min_font_size=8, max_font_size=32):
-     return ImageFont.truetype("./arial.ttf", size=random.randint(min_font_size, max_font_size))
+def random_font(min_font_size=8, max_font_size=32, font='fonts/Monaco.ttf'):
+     return ImageFont.truetype(font, size=random.randint(min_font_size, max_font_size))
 
 
 
@@ -70,15 +72,3 @@ def generate_random_image(min_n_texts=1, max_n_texts=4,
         max_font_size=max_font_size
     )
     return image
-
-
-generate_params = dict(
-    min_n_texts=1,
-    max_n_texts=4,
-    height=256,
-    width=256,
-    min_n_lines=1,
-    max_n_lines=4,
-    min_font_size=8,
-    max_font_size=32
-)
