@@ -1,10 +1,6 @@
 from tkinter import TOP
-from unittest import loader
-
-from sklearn import naive_bayes
 from dataset_generator import generate_random_image, showImagesHorizontally
 from utils import seed_everything
-# from model import VQVAE2
 from config import generate_params
 
 from tqdm.auto import tqdm
@@ -23,8 +19,50 @@ codebook_size = 32  #1#2##8#16 # 2 ** 14 # 16k
 
 
 # CONSTS
+
 seed = 42
+
+# train params
 device = 'cuda:0'
+batch_size = 64
+n_epochs = 1_000
+epoch_len = 2
+
+# model params
+model_params = dict(
+    input_channels=3,
+    n_hid=64,
+    n_downsamples=3,
+    n_bottlenecks=2,
+    codebook_size=16,
+    code_size=32
+)
+
+# optimizer params
+lr = 1e-4
+
+# save params
+saveroot = './snapshots'
+savedir = f'train_orig_cs{model_params["codebook_size"]}'
+savename = 'snapshot.tar'
+savepath = os.path.join(saveroot, savedir, savename)
+
+samples_saveroot = f'./samples/train_orig_cs{model_params["codebook_size"]}'
+
+try:
+    os.makedirs(os.path.join(saveroot, savedir))
+    os.makedirs(samples_saveroot)
+except:
+    ans = input(f'Do you want to remove {savedir} run? y/n: ')
+    if ans != 'y':
+        exit(0)
+    shutil.rmtree(os.path.join(saveroot, savedir))
+    os.makedirs(os.path.join(saveroot, savedir))
+    shutil.rmtree(samples_saveroot)
+    os.makedirs(samples_saveroot)
+
+
+samples_saveroot = f'samples/train_orig_cs{model_params["codebook_size"]}/'
 
 class GumbelQuantize(nn.Module):
     """
@@ -32,26 +70,26 @@ class GumbelQuantize(nn.Module):
     Categorical Reparameterization with Gumbel-Softmax, Jang et al. 2016
     https://arxiv.org/abs/1611.01144
     """
-    def __init__(self, num_hiddens, n_embed, embedding_dim, straight_through=False):
+    def __init__(self, num_hiddens, n_embed, embedding_dim):
         super().__init__()
 
         self.embedding_dim = embedding_dim
         self.n_embed = n_embed
 
-        self.straight_through = straight_through
-        self.temperature = 1.0
+        # self.temperature = 1.0
         self.kld_scale = 5e-4
 
         self.proj = nn.Conv2d(num_hiddens, n_embed, 1)
         self.embed = nn.Embedding(n_embed, embedding_dim)
 
-    def forward(self, z):
+    def forward(self, z, tau=1):
 
         # force hard = True when we are in eval mode, as we must quantize
-        hard = self.straight_through if self.training else True
+        # hard = self.straight_through if self.training else True
+        hard = True
 
         logits = self.proj(z)
-        soft_one_hot = F.gumbel_softmax(logits, tau=self.temperature, dim=1, hard=hard)
+        soft_one_hot = F.gumbel_softmax(logits, tau=tau, dim=1, hard=hard)
         z_q = torch.einsum('b n h w, n d -> b d h w', soft_one_hot, self.embed.weight)
 
         # + kl divergence to the prior loss
@@ -159,15 +197,6 @@ class VQVAE(nn.Module):
                                        n_upsamples=n_downsamples, n_bottlenecks=n_bottlenecks)
         self.quantizer = GumbelQuantize(self.encoder.output_channels, codebook_size, code_size)
 
-        # the data reconstruction loss in the ELBO
-        # ReconLoss = {
-        #     'l2': Normal,
-        #     'logit_laplace': LogitLaplace,
-        #     # todo: add vqgan
-        # }[args.loss_flavor]
-        # self.recon_loss = ReconLoss
-        # self.recon_loss = Normal
-
 
     def forward(self, x):
         z = self.encoder(x)
@@ -176,84 +205,61 @@ class VQVAE(nn.Module):
         return x_hat, latent_loss
 
 
-saveroot = './snapshots'
-savedir = 'train_orig_1cs'
-savename = 'snapshot.tar'
-
-os.makedirs(os.path.join(saveroot, savedir), exist_ok=True)
-savepath = os.path.join(saveroot, savedir, savename)
-
-
 class CustomDataLoader():
-    def __init__(self, batch_size, transform, inv_transform, epoch_len, generate_params):
+    def __init__(self, batch_size, transform, inv_transform, generate_params):
         super().__init__()
         self.batch_size = batch_size
         self.transform = transform
         self.inv_transform = inv_transform
         self.generate_params = generate_params
+        self.to_pil = ToPILImage()
     
     def get_batch(self, device):
-        images = [self.transform(generate_random_image(**self.generate_params) for _ in range(self.batch_size))]
+        images = [self.transform(generate_random_image(**self.generate_params)) for _ in range(self.batch_size)]
         images = torch.stack(images)
+        images = images.to(device)
         return images
     
     def recover_images(self, images):
-        return [self.inv_transform(image) for image in images]
+        return self.inv_transform(images)
 
 
-
-# def get_batch(batch_size, transform, **generate_params):
-#     return torch.stack([transform(generate_random_image(**generate_params))
-#                         for _ in range(batch_size)])
-
-
-
-# gumbel softmax params
-# tau = 0.1
-# hard = True
-
-# regularizers
-# target_density = 0.1  # kl reg will aim to leave this fraction of logits
-# beta_max = 0.1  # kl strength from beta vae
-# beta_warmup_epochs = 200
-# cv_reg = 0.1  # load balancing strength from shazeer
-# eps=1e-6
-
-# training
-# batch_size = 32
-# device = 'cpu'
-
-
-def train(model, optimizer):
-    n_epochs = 1_000
-    n_epoch_steps = 128
-    batch_size = 4
-
+def train(model, data: CustomDataLoader, optimizer, device, n_epochs, epoch_len, validation_data=None):
     metrics = defaultdict(list)
-    if os.path.exists('samples/train_orig_1cs'):
-        shutil.rmtree('samples/train_orig_1cs')
-    os.makedirs('samples/train_orig_1cs')
 
     for epoch in range(n_epochs):
-        for epoch_step in tqdm(range(n_epoch_steps)):
-            images = get_batch(batch_size=batch_size, transform=transform, **generate_params)
-            images = images.to(device)
+        for epoch_step in tqdm(range(epoch_len)):
+            step = epoch * epoch_len + epoch_step
 
-            images = model.recon_loss.inmap(images)
-            x_hat, latent_loss, ind = model(images)
-            recon_loss = model.recon_loss.nll(images, x_hat)
+            images = data.get_batch(device)
+
+            images_recon, latent_loss = model(images)
+
+            recon_loss = F.mse_loss(images, images_recon)
             loss = recon_loss + latent_loss
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
-        images = model.recon_loss.unmap(images).detach().cpu()
-        recon_images = model.recon_loss.unmap(x_hat).detach().cpu()
-        grid = torch.cat([images, recon_images], dim=0)
-        grid = torchvision.utils.make_grid(grid, nrow=batch_size)
-        grid = ToPILImage()(grid)
-        grid.save(f'samples/train_orig_1cs/epoch_{str(epoch).zfill(4)}.png')
+        
+        if validation_data is not None:
+            with torch.inference_mode():
+                validation_recon, _ = model(data.transform(validation_data).to(device))
+            validation_recon = data.recover_images(validation_recon)
+        # recon_images = data.recover_images(images_recon)
+            grid = torch.cat([validation_data, validation_recon], dim=0)
+            grid = torchvision.utils.make_grid(grid, nrow=grid.size(0) // 2)
+            grid = data.to_pil(grid)
+            grid.save(os.path.join(samples_saveroot, f'epoch_{str(epoch).zfill(4)}.png'))
         # print(f"Epoch #{epoch} LLH={-neg_llh.item():.5f}, KL={kl.item():.5f}, mean p(0)={logp_zero.exp().item():.5f}, cv^2={cv_squared.item():.5f}")
-        print(f"Epoch #{epoch} LLH={loss.item():.5f}")
+        print(f'Epoch #{epoch}:', end='\t')
+        for key, value in zip(
+            ['recon_loss', 'latent_loss', 'loss'],
+            [recon_loss.item(), latent_loss.item(), loss.item()]
+        ):
+            metrics[key].append(value)
+            print(f'{key} = {value:.5f}', end='\t')
+        print()
+        # print(f"Epoch #{epoch} LLH={loss.item():.5f}")
         print('Saving model...')
         for key, value in zip(
             ['LLH'],
@@ -266,7 +272,8 @@ def train(model, optimizer):
 def save_snapshot(model, metrics, savepath):
     snapshot = {
         'model': model.state_dict(),
-        'metrics': metrics
+        'metrics': metrics,
+        'model_params': model_params 
     }
     torch.save(snapshot, savepath)
     print('Model has been saved...')
@@ -274,12 +281,26 @@ def save_snapshot(model, metrics, savepath):
 
 def main():
     seed_everything(seed)
-    model = VQVAE()
-    opt = torch.optim.Adam(model.parameters(), 1e-4)
+
+    transform = T.Compose([
+        T.ToTensor(),
+        T.Lambda(lambda x: 2 * x - 1)  # 2 * x - 1 == (x - 0.5) / 0.5
+    ])
+    inv_transform = T.Compose([
+        T.Lambda(lambda x: (x + 1) / 2),
+        # T.ToPILImage()
+    ])
+
+    data = CustomDataLoader(batch_size, transform, inv_transform, generate_params)
+    n_val_images = 5
+    validation_data = torch.stack([data.transform(generate_random_image(**generate_params)) for _ in range(n_val_images)])
+
+    model = VQVAE(**model_params)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     model = model.to(device)
-    
-    transform = ToTensor()
+
+    train(model, data, optimizer, device=device, n_epochs=n_epochs, epoch_len=epoch_len, validation_data=validation_data)
 
 
 if __name__ == '__main__':
-    train()
+    main()

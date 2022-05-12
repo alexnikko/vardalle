@@ -3,15 +3,13 @@ from PIL import Image, ImageDraw, ImageFont
 
 import matplotlib.pyplot as plt
 
-
-
 try:
     from nltk.corpus import words
+    word_list = words.words()
 except:
     import nltk
     nltk.download('words')
 
-word_list = words.words()
 
 def showImagesHorizontally(images, figsize=(16, 16)):
     fig = plt.figure(figsize=figsize)
