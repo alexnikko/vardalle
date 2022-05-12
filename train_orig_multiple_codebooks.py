@@ -16,7 +16,9 @@ import os
 import shutil
 import torchvision
 
-codebook_size = 1#2##8#16 # 2 ** 14 # 16k
+codebook_size = 4  #1#2##8#16 # 2 ** 14 # 16k
+num_codebooks = 4
+
 
 class GumbelQuantize(nn.Module):
     """
@@ -24,33 +26,43 @@ class GumbelQuantize(nn.Module):
     Categorical Reparameterization with Gumbel-Softmax, Jang et al. 2016
     https://arxiv.org/abs/1611.01144
     """
-    def __init__(self, num_hiddens, n_embed, embedding_dim, straight_through=False):
+    def __init__(self, num_hiddens, num_codebooks, n_embed, embedding_dim, straight_through=False):
         super().__init__()
 
         self.embedding_dim = embedding_dim
+        self.num_codebooks = num_codebooks
         self.n_embed = n_embed
 
         self.straight_through = straight_through
         self.temperature = 1.0
         self.kld_scale = 5e-4
 
-        self.proj = nn.Conv2d(num_hiddens, n_embed, 1)
-        self.embed = nn.Embedding(n_embed, embedding_dim)
+        self.proj = nn.Conv2d(num_hiddens, num_codebooks * n_embed, 1)
+        self.embed = nn.Embedding(num_codebooks * n_embed, num_codebooks * embedding_dim)
 
     def forward(self, z):
 
         # force hard = True when we are in eval mode, as we must quantize
         hard = self.straight_through if self.training else True
 
+        batch, num_hiddens, height, width = z.shape
+
         logits = self.proj(z)
-        soft_one_hot = F.gumbel_softmax(logits, tau=self.temperature, dim=1, hard=hard)
+        logits = logits.view(batch, self.num_codebooks, self.n_embed, height, width)
+
+        # soft_one_hot = F.gumbel_softmax(logits, tau=self.temperature, dim=1, hard=hard)
+        soft_one_hot = F.gumbel_softmax(logits, tau=self.temperature, hard=hard, dim=-3)
+        soft_one_hot = soft_one_hot.view(batch, -1, height, width)
         z_q = torch.einsum('b n h w, n d -> b d h w', soft_one_hot, self.embed.weight)
 
         # + kl divergence to the prior loss
-        qy = F.softmax(logits, dim=1)
-        diff = self.kld_scale * torch.sum(qy * torch.log(qy * self.n_embed + 1e-10), dim=1).mean()
+        # qy = F.softmax(logits, dim=1)
+        qy = F.softmax(logits, dim=-3)
+        # diff = self.kld_scale * torch.sum(qy * torch.log(qy * self.n_embed + 1e-10), dim=1).mean()
+        diff = self.kld_scale * torch.sum(qy * torch.log(qy * self.n_embed + 1e-10), dim=-3).mean()
 
-        ind = soft_one_hot.argmax(dim=1)
+        # ind = soft_one_hot.argmax(dim=1)
+        ind = soft_one_hot.argmax(dim=-3)
         return z_q, diff, ind
 
 
@@ -154,12 +166,14 @@ class Normal:
         return ((x - mu) ** 2).mean() / (2 * cls.data_variance) #+ math.log(math.sqrt(2 * math.pi * cls.data_variance))
 
 class VQVAE(nn.Module):
-
-    def __init__(self, input_channels=3):
+    def __init__(
+        self, input_channels=3, n_hid=64, n_init=32,
+        num_codebooks=num_codebooks, codebook_size=codebook_size, embedding_dim=32
+    ):
         super().__init__()
-        self.encoder = DeepMindEncoder(input_channels=input_channels)
-        self.decoder = DeepMindDecoder(output_channels=input_channels)
-        self.quantizer = GumbelQuantize(self.encoder.output_channels, codebook_size, 32)
+        self.encoder = DeepMindEncoder(input_channels=input_channels, n_hid=n_hid)
+        self.decoder = DeepMindDecoder(n_init=embedding_dim * num_codebooks, n_hid=n_hid, output_channels=input_channels)
+        self.quantizer = GumbelQuantize(self.encoder.output_channels, num_codebooks, codebook_size, embedding_dim)
 
         # the data reconstruction loss in the ELBO
         # ReconLoss = {
@@ -173,14 +187,18 @@ class VQVAE(nn.Module):
 
     def forward(self, x):
         z = self.encoder(x)
+        # print(z.shape)
         z_q, latent_loss, ind = self.quantizer(z)
+        # print(z_q.shape)
         x_hat = self.decoder(z_q)
         return x_hat, latent_loss, ind
 
 
 saveroot = './snapshots'
-savedir = 'train_orig_1cs'
+savedir = f'train_orig_{num_codebooks}nc_{codebook_size}cs'
 savename = 'snapshot.tar'
+
+samples_savedir = f'samples/{savedir}'
 
 os.makedirs(os.path.join(saveroot, savedir), exist_ok=True)
 savepath = os.path.join(saveroot, savedir, savename)
@@ -237,9 +255,9 @@ def train():
     batch_size = 4
 
     metrics = defaultdict(list)
-    if os.path.exists('samples/train_orig_1cs'):
-        shutil.rmtree('samples/train_orig_1cs')
-    os.makedirs('samples/train_orig_1cs')
+    if os.path.exists(samples_savedir):
+        shutil.rmtree(samples_savedir)
+    os.makedirs(samples_savedir)
 
     for epoch in range(n_epochs):
         for epoch_step in tqdm(range(n_epoch_steps)):
@@ -278,7 +296,7 @@ def train():
         grid = torch.cat([images, recon_images], dim=0)
         grid = torchvision.utils.make_grid(grid, nrow=batch_size)
         grid = ToPILImage()(grid)
-        grid.save(f'samples/train_orig_1cs/epoch_{str(epoch).zfill(4)}.png')
+        grid.save(f'{samples_savedir}/epoch_{str(epoch).zfill(4)}.png')
         # print(f"Epoch #{epoch} LLH={-neg_llh.item():.5f}, KL={kl.item():.5f}, mean p(0)={logp_zero.exp().item():.5f}, cv^2={cv_squared.item():.5f}")
         print(f"Epoch #{epoch} LLH={loss.item():.5f}")
         print('Saving model...')
