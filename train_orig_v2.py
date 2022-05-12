@@ -243,10 +243,11 @@ def train(model, data: CustomDataLoader, optimizer, device, n_epochs, epoch_len,
         
         if validation_data is not None:
             with torch.inference_mode():
-                validation_recon, _ = model(data.transform(validation_data).to(device))
-            validation_recon = data.recover_images(validation_recon)
+                validation_recon, _ = model(validation_data.to(device))
+            validation_data_recovered = data.recover_images(validation_data)
+            validation_recon_recovered = data.recover_images(validation_recon)
         # recon_images = data.recover_images(images_recon)
-            grid = torch.cat([validation_data, validation_recon], dim=0)
+            grid = torch.cat([validation_data_recovered, validation_recon_recovered], dim=0)
             grid = torchvision.utils.make_grid(grid, nrow=grid.size(0) // 2)
             grid = data.to_pil(grid)
             grid.save(os.path.join(samples_saveroot, f'epoch_{str(epoch).zfill(4)}.png'))
