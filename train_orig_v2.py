@@ -24,9 +24,10 @@ seed = 42
 
 # train params
 device = 'cuda:0'
-batch_size = 64
+batch_size = 256
 n_epochs = 1_000
-epoch_len = 2
+epoch_len = 64
+r = 1e-4
 
 # model params
 model_params = dict(
@@ -198,9 +199,9 @@ class VQVAE(nn.Module):
         self.quantizer = GumbelQuantize(self.encoder.output_channels, codebook_size, code_size)
 
 
-    def forward(self, x):
+    def forward(self, x, tau=1):
         z = self.encoder(x)
-        z_q, latent_loss = self.quantizer(z)
+        z_q, latent_loss = self.quantizer(z, tau=tau)
         x_hat = self.decoder(z_q)
         return x_hat, latent_loss
 
@@ -221,25 +222,30 @@ class CustomDataLoader():
         return images
     
     def recover_images(self, images):
-        return self.inv_transform(images)
+        return self.inv_transform(images.detach().cpu())
 
 
 def train(model, data: CustomDataLoader, optimizer, device, n_epochs, epoch_len, validation_data=None):
     metrics = defaultdict(list)
+    metrics_names = ['recon_loss', 'latent_loss', 'loss']
 
     for epoch in range(n_epochs):
         for epoch_step in tqdm(range(epoch_len)):
             step = epoch * epoch_len + epoch_step
+            tau = max(0.3, np.exp(-r * step))
 
             images = data.get_batch(device)
 
-            images_recon, latent_loss = model(images)
+            images_recon, latent_loss = model(images, tau=tau)
 
             recon_loss = F.mse_loss(images, images_recon)
             loss = recon_loss + latent_loss
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
+
+            for key, value in zip(metrics_names, [recon_loss.item(), latent_loss.item(), loss.item()]):
+                metrics[key].append(value)
         
         if validation_data is not None:
             with torch.inference_mode():
@@ -253,12 +259,15 @@ def train(model, data: CustomDataLoader, optimizer, device, n_epochs, epoch_len,
             grid.save(os.path.join(samples_saveroot, f'epoch_{str(epoch).zfill(4)}.png'))
         # print(f"Epoch #{epoch} LLH={-neg_llh.item():.5f}, KL={kl.item():.5f}, mean p(0)={logp_zero.exp().item():.5f}, cv^2={cv_squared.item():.5f}")
         print(f'Epoch #{epoch}:', end='\t')
-        for key, value in zip(
-            ['recon_loss', 'latent_loss', 'loss'],
-            [recon_loss.item(), latent_loss.item(), loss.item()]
-        ):
-            metrics[key].append(value)
-            print(f'{key} = {value:.5f}', end='\t')
+        for key, value in metrics.items():
+            print(f'{key} = {np.mean(value[-epoch_len:]):.5f}\t', end='\t')
+        print(f'cur step = {step}\tcur tau = {tau:.5f}', end='\t')
+        # for key, value in zip(
+        #     ['recon_loss', 'latent_loss', 'loss'],
+        #     [recon_loss.item(), latent_loss.item(), loss.item()]
+        # ):
+        #     metrics[key].append(value)
+        #     print(f'{key} = {value:.5f}', end='\t')
         print()
         # print(f"Epoch #{epoch} LLH={loss.item():.5f}")
         print('Saving model...')
