@@ -94,7 +94,7 @@ class GumbelQuantize(nn.Module):
 
         # + kl divergence to the prior loss
         qy = F.softmax(logits, dim=-3)
-        diff = self.kld_scale * torch.sum(qy * torch.log(qy * self.n_embed + 1e-10), dim=1).mean()
+        diff = self.kld_scale * torch.sum(qy * torch.log(qy * self.n_embed + 1e-10), dim=-3).mean()
 
         qy_log = F.log_softmax(logits, dim=-3)
         total_patches = z_q.shape[0] * np.prod(z_q.shape[-2:])
