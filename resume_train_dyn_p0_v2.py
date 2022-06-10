@@ -22,8 +22,9 @@ torch.set_num_threads(4)
 seed = 42
 
 # train params
-device = 'cuda:3'
+device = 'cuda:0'
 batch_size = 256
+start_epoch = 1_000
 n_epochs = 5_000
 epoch_len = 64
 r = 3e-5
@@ -38,7 +39,7 @@ model_params = dict(
     n_bottlenecks=4,
     code_size=64,
 
-    codebook_size=4,
+    codebook_size=8,
     num_codebooks=16,
     target_density=0.1,
 )
@@ -54,6 +55,8 @@ savename = 'snapshot.tar'
 savepath = os.path.join(saveroot, savedir, savename)
 
 samples_saveroot = f'./samples/{savedir}'
+
+
 
 
 # samples_saveroot = f'samples/train_orig_cs{model_params["codebook_size"]}/'
@@ -234,11 +237,16 @@ class CustomDataLoader():
         return self.inv_transform(images.detach().cpu())
 
 
-def train(model, data: CustomDataLoader, optimizer, device, n_epochs, epoch_len, validation_data=None):
-    metrics = defaultdict(list)
+def resume_train(model, data: CustomDataLoader, optimizer, device, start_epoch, n_epochs, epoch_len, validation_data=None, exist_metrics=None):
     metrics_names = ['recon_loss', 'latent_loss', 'kl_p0', 'loss']
+    if exist_metrics is None:
+        metrics = defaultdict(list)
+    else:
+        metrics = exist_metrics
+        for name in metrics_names:
+            assert name in metrics
 
-    for epoch in range(n_epochs):
+    for epoch in range(start_epoch, n_epochs):
         for epoch_step in tqdm(range(epoch_len)):
             step = epoch * epoch_len + epoch_step
             tau = max(0.3, np.exp(-r * step))
@@ -289,18 +297,6 @@ def save_snapshot(model, metrics, savepath):
 def main():
     seed_everything(seed)
 
-    try:
-        os.makedirs(os.path.join(saveroot, savedir))
-        os.makedirs(samples_saveroot)
-    except:
-        ans = input(f'Do you want to remove {savedir} run? y/n: ')
-        if ans != 'y':
-            exit(0)
-        shutil.rmtree(os.path.join(saveroot, savedir))
-        os.makedirs(os.path.join(saveroot, savedir))
-        shutil.rmtree(samples_saveroot)
-        os.makedirs(samples_saveroot)
-
     transform = T.Compose([
         T.ToTensor(),
         T.Lambda(lambda x: 2 * x - 1)  # 2 * x - 1 == (x - 0.5) / 0.5
@@ -314,11 +310,18 @@ def main():
     n_val_images = 5
     validation_data = torch.stack([data.transform(generate_random_image(**generate_params)) for _ in range(n_val_images)])
 
+    seed_everything(seed + 122333)
+
     model = VQVAE(**model_params)
+
+    snapshot = torch.load(savepath, map_location='cpu')
+    print(snapshot['model_params'])
+    model.load_state_dict(snapshot['model'])
+
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     model = model.to(device)
-
-    train(model, data, optimizer, device=device, n_epochs=n_epochs, epoch_len=epoch_len, validation_data=validation_data)
+    resume_train(model, data, optimizer, device=device, start_epoch=start_epoch, n_epochs=n_epochs,
+                 epoch_len=epoch_len, validation_data=validation_data, exist_metrics=snapshot['metrics'])
 
 
 if __name__ == '__main__':

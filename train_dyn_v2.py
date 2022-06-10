@@ -34,8 +34,8 @@ model_params = dict(
     n_hid=64,
     n_downsamples=4,
     n_bottlenecks=4,
-    codebook_size=32,
     code_size=64,
+    codebook_size=32,
     num_codebooks=8,
 )
 
@@ -54,8 +54,7 @@ samples_saveroot = f'./samples/{savedir}'
 
 
 
-# samples_saveroot = f'samples/train_orig_cs{model_params["codebook_size"]}/'
-
+# samples_saveroot = f'samples/train_orig_cs{model_params["codebook_size"]}/
 class GumbelQuantize(nn.Module):
     """
     Gumbel Softmax trick quantizer
@@ -92,8 +91,8 @@ class GumbelQuantize(nn.Module):
 
         # + kl divergence to the prior loss
         qy = F.softmax(logits, dim=-3)
-        diff = self.kld_scale * torch.sum(qy * torch.log(qy * self.n_embed + 1e-10), dim=-3).mean()
-
+        diff = self.kld_scale * torch.sum(qy * torch.log(qy * self.n_embed + 1e-10), dim=1).mean()
+        # TODO: пометить папки с экспериментами, в которых будешь пофикшен этот баг ^
         # ind = soft_one_hot.argmax(dim=1)
         return z_q, diff
 

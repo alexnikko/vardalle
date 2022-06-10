@@ -22,38 +22,36 @@ torch.set_num_threads(4)
 seed = 42
 
 # train params
-device = 'cuda:3'
+device = 'cuda:0'
 batch_size = 256
+start_epoch = 1_500
 n_epochs = 5_000
 epoch_len = 64
 r = 3e-5
-beta_max = 0.1
-beta_warmup_epochs = 500
 
 # model params
 model_params = dict(
     input_channels=3,
     n_hid=64,
-    n_downsamples=4,
-    n_bottlenecks=4,
+    n_downsamples=3,
+    n_bottlenecks=3,
     code_size=64,
 
-    codebook_size=4,
-    num_codebooks=16,
-    target_density=0.1,
+    codebook_size=128,
 )
 
 # optimizer params
 lr = 1e-4
 
-# nc = num_codebooks, cs = codebook_size
 # save params
 saveroot = './snapshots'
-savedir = f'train_orig_cs{model_params["codebook_size"]}_nc{model_params["num_codebooks"]}_p0_16x16'
+savedir = f'train_orig_cs{model_params["codebook_size"]}'
 savename = 'snapshot.tar'
 savepath = os.path.join(saveroot, savedir, savename)
 
 samples_saveroot = f'./samples/{savedir}'
+
+
 
 
 # samples_saveroot = f'samples/train_orig_cs{model_params["codebook_size"]}/'
@@ -64,20 +62,17 @@ class GumbelQuantize(nn.Module):
     Categorical Reparameterization with Gumbel-Softmax, Jang et al. 2016
     https://arxiv.org/abs/1611.01144
     """
-    def __init__(self, num_hiddens, n_embed, embedding_dim, num_codebooks, target_density=0.1):
+    def __init__(self, num_hiddens, n_embed, embedding_dim):
         super().__init__()
 
-        self.num_hiddens = num_hiddens
-        self.n_embed = n_embed
         self.embedding_dim = embedding_dim
-        self.num_codebooks = num_codebooks
-        self.target_density = target_density
+        self.n_embed = n_embed
 
         # self.temperature = 1.0
         self.kld_scale = 5e-4
 
-        self.proj = nn.Conv2d(num_hiddens, num_codebooks * n_embed, 1)
-        self.embed = nn.Embedding(num_codebooks * n_embed, num_codebooks * embedding_dim)
+        self.proj = nn.Conv2d(num_hiddens, n_embed, 1)
+        self.embed = nn.Embedding(n_embed, embedding_dim)
 
     def forward(self, z, tau=1):
 
@@ -85,28 +80,16 @@ class GumbelQuantize(nn.Module):
         # hard = self.straight_through if self.training else True
         hard = True
 
-        batch, _, height, width = z.shape
-
         logits = self.proj(z)
-        logits = logits.view(batch, self.num_codebooks, self.n_embed, height, width)
-
-        soft_one_hot = F.gumbel_softmax(logits, tau=tau, hard=hard, dim=-3)
-        soft_one_hot = soft_one_hot.view(batch, -1, height, width)
+        soft_one_hot = F.gumbel_softmax(logits, tau=tau, dim=1, hard=hard)
         z_q = torch.einsum('b n h w, n d -> b d h w', soft_one_hot, self.embed.weight)
 
         # + kl divergence to the prior loss
-        qy = F.softmax(logits, dim=-3)
+        qy = F.softmax(logits, dim=1)
         diff = self.kld_scale * torch.sum(qy * torch.log(qy * self.n_embed + 1e-10), dim=1).mean()
 
-        qy_log = F.log_softmax(logits, dim=-3)
-        total_patches = z_q.shape[0] * np.prod(z_q.shape[-2:])
-        log_denominator = np.log(total_patches * self.num_codebooks)
-        logp_zero = torch.logsumexp(qy_log[..., 0, :, :].flatten(), 0) - log_denominator
-        logp_nonzero = torch.logsumexp(qy_log[..., 1:, :, :].flatten(), 0) - log_denominator
-        kl_p0 = - ((1 - self.target_density) * logp_zero + self.target_density * logp_nonzero)
-
         # ind = soft_one_hot.argmax(dim=1)
-        return z_q, diff, kl_p0
+        return z_q, diff
 
 
 class ResBlock(nn.Module):
@@ -198,21 +181,20 @@ class DeepMindDecoder(nn.Module):
 
 class VQVAE(nn.Module):
 
-    def __init__(self, input_channels=3, n_hid=64, n_downsamples=3, n_bottlenecks=2,
-                       codebook_size=16, code_size=32, num_codebooks=4, target_density=0.1):
+    def __init__(self, input_channels=3, n_hid=64, n_downsamples=3, n_bottlenecks=2, codebook_size=16, code_size=32):
         super().__init__()
         self.encoder = DeepMindEncoder(input_channels=input_channels, n_hid=n_hid,
                                        n_downsamples=n_downsamples, n_bottlenecks=n_bottlenecks)
-        self.decoder = DeepMindDecoder(output_channels=input_channels, n_init=num_codebooks * code_size, n_hid=n_hid,
+        self.decoder = DeepMindDecoder(output_channels=input_channels, n_init=code_size, n_hid=n_hid,
                                        n_upsamples=n_downsamples, n_bottlenecks=n_bottlenecks)
-        self.quantizer = GumbelQuantize(self.encoder.output_channels, codebook_size, code_size, num_codebooks, target_density)
+        self.quantizer = GumbelQuantize(self.encoder.output_channels, codebook_size, code_size)
 
 
     def forward(self, x, tau=1):
         z = self.encoder(x)
-        z_q, latent_loss, kl_p0 = self.quantizer(z, tau=tau)
+        z_q, latent_loss = self.quantizer(z, tau=tau)
         x_hat = self.decoder(z_q)
-        return x_hat, latent_loss, kl_p0
+        return x_hat, latent_loss
 
 
 class CustomDataLoader():
@@ -234,32 +216,36 @@ class CustomDataLoader():
         return self.inv_transform(images.detach().cpu())
 
 
-def train(model, data: CustomDataLoader, optimizer, device, n_epochs, epoch_len, validation_data=None):
-    metrics = defaultdict(list)
-    metrics_names = ['recon_loss', 'latent_loss', 'kl_p0', 'loss']
+def resume_train(model, data: CustomDataLoader, optimizer, device, start_epoch, n_epochs, epoch_len, validation_data=None, exist_metrics=None):
+    metrics_names = ['recon_loss', 'latent_loss', 'loss']
+    if exist_metrics is None:
+        metrics = defaultdict(list)
+    else:
+        metrics = exist_metrics
+        for name in metrics_names:
+            assert name in metrics
 
-    for epoch in range(n_epochs):
+    for epoch in range(start_epoch, n_epochs):
         for epoch_step in tqdm(range(epoch_len)):
             step = epoch * epoch_len + epoch_step
             tau = max(0.3, np.exp(-r * step))
 
             images = data.get_batch(device)
 
-            images_recon, latent_loss, kl_p0 = model(images, tau=tau)
+            images_recon, latent_loss = model(images, tau=tau)
 
             recon_loss = F.mse_loss(images, images_recon)
-            beta = beta_max * min(1.0, epoch / beta_warmup_epochs)
-            loss = recon_loss + latent_loss + beta * kl_p0
+            loss = recon_loss + latent_loss
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
 
-            for key, value in zip(metrics_names, [recon_loss.item(), latent_loss.item(), kl_p0.item(), loss.item()]):
+            for key, value in zip(metrics_names, [recon_loss.item(), latent_loss.item(), loss.item()]):
                 metrics[key].append(value)
         
         if validation_data is not None:
             with torch.inference_mode():
-                validation_recon, _, _ = model(validation_data.to(device))
+                validation_recon, _ = model(validation_data.to(device))
             validation_data_recovered = data.recover_images(validation_data)
             validation_recon_recovered = data.recover_images(validation_recon)
             grid = torch.cat([validation_data_recovered, validation_recon_recovered], dim=0)
@@ -289,18 +275,6 @@ def save_snapshot(model, metrics, savepath):
 def main():
     seed_everything(seed)
 
-    try:
-        os.makedirs(os.path.join(saveroot, savedir))
-        os.makedirs(samples_saveroot)
-    except:
-        ans = input(f'Do you want to remove {savedir} run? y/n: ')
-        if ans != 'y':
-            exit(0)
-        shutil.rmtree(os.path.join(saveroot, savedir))
-        os.makedirs(os.path.join(saveroot, savedir))
-        shutil.rmtree(samples_saveroot)
-        os.makedirs(samples_saveroot)
-
     transform = T.Compose([
         T.ToTensor(),
         T.Lambda(lambda x: 2 * x - 1)  # 2 * x - 1 == (x - 0.5) / 0.5
@@ -314,11 +288,18 @@ def main():
     n_val_images = 5
     validation_data = torch.stack([data.transform(generate_random_image(**generate_params)) for _ in range(n_val_images)])
 
+    seed_everything(seed + 122333)
+
     model = VQVAE(**model_params)
+
+    snapshot = torch.load(savepath, map_location='cpu')
+    print(snapshot['model_params'])
+    model.load_state_dict(snapshot['model'])
+
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     model = model.to(device)
-
-    train(model, data, optimizer, device=device, n_epochs=n_epochs, epoch_len=epoch_len, validation_data=validation_data)
+    resume_train(model, data, optimizer, device=device, start_epoch=start_epoch, n_epochs=n_epochs,
+                 epoch_len=epoch_len, validation_data=validation_data, exist_metrics=snapshot['metrics'])
 
 
 if __name__ == '__main__':

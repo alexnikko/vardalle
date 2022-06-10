@@ -15,6 +15,11 @@ import os
 import shutil
 import torchvision
 
+# for key, value in generate_params.items():
+    # print(key, value)
+generate_params['max_n_texts'] = 2
+print('max_n_texts', generate_params['max_n_texts'])
+
 
 torch.set_num_threads(4)
 
@@ -22,7 +27,7 @@ torch.set_num_threads(4)
 seed = 42
 
 # train params
-device = 'cuda:3'
+device = 'cuda:1'
 batch_size = 256
 n_epochs = 5_000
 epoch_len = 64
@@ -33,9 +38,9 @@ beta_warmup_epochs = 500
 # model params
 model_params = dict(
     input_channels=3,
-    n_hid=64,
+    n_hid=28,
     n_downsamples=4,
-    n_bottlenecks=4,
+    n_bottlenecks=5,
     code_size=64,
 
     codebook_size=4,
@@ -49,7 +54,7 @@ lr = 1e-4
 # nc = num_codebooks, cs = codebook_size
 # save params
 saveroot = './snapshots'
-savedir = f'train_orig_cs{model_params["codebook_size"]}_nc{model_params["num_codebooks"]}_p0_16x16'
+savedir = f'n_texts_2/train_orig_cs{model_params["codebook_size"]}_nc{model_params["num_codebooks"]}_p0_16x16_honest'
 savename = 'snapshot.tar'
 savepath = os.path.join(saveroot, savedir, savename)
 
@@ -77,7 +82,7 @@ class GumbelQuantize(nn.Module):
         self.kld_scale = 5e-4
 
         self.proj = nn.Conv2d(num_hiddens, num_codebooks * n_embed, 1)
-        self.embed = nn.Embedding(num_codebooks * n_embed, num_codebooks * embedding_dim)
+        self.embed = nn.Embedding(num_codebooks * n_embed, embedding_dim)
 
     def forward(self, z, tau=1):
 
@@ -96,7 +101,7 @@ class GumbelQuantize(nn.Module):
 
         # + kl divergence to the prior loss
         qy = F.softmax(logits, dim=-3)
-        diff = self.kld_scale * torch.sum(qy * torch.log(qy * self.n_embed + 1e-10), dim=1).mean()
+        diff = self.kld_scale * torch.sum(qy[:, :, 0:, :, :] * torch.log(qy[:, :, 0:, :, :] * (self.n_embed - 1) + 1e-10), dim=-3).mean()
 
         qy_log = F.log_softmax(logits, dim=-3)
         total_patches = z_q.shape[0] * np.prod(z_q.shape[-2:])
@@ -203,7 +208,7 @@ class VQVAE(nn.Module):
         super().__init__()
         self.encoder = DeepMindEncoder(input_channels=input_channels, n_hid=n_hid,
                                        n_downsamples=n_downsamples, n_bottlenecks=n_bottlenecks)
-        self.decoder = DeepMindDecoder(output_channels=input_channels, n_init=num_codebooks * code_size, n_hid=n_hid,
+        self.decoder = DeepMindDecoder(output_channels=input_channels, n_init=code_size, n_hid=n_hid,
                                        n_upsamples=n_downsamples, n_bottlenecks=n_bottlenecks)
         self.quantizer = GumbelQuantize(self.encoder.output_channels, codebook_size, code_size, num_codebooks, target_density)
 
@@ -274,6 +279,7 @@ def train(model, data: CustomDataLoader, optimizer, device, n_epochs, epoch_len,
         print()
         print('Saving model...')
         save_snapshot(model, metrics, savepath)
+        # assert False
 
 
 def save_snapshot(model, metrics, savepath):

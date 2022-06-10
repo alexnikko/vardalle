@@ -18,24 +18,28 @@ import torchvision
 
 torch.set_num_threads(4)
 
+# generate_params['max_n_texts'] = 2
+# print('max_n_texts', generate_params['max_n_texts'])
+
 # CONSTS
 seed = 42
 
 # train params
-device = 'cuda:2'
-batch_size = 256
-n_epochs = 1_000
-epoch_len = 64
+device = 'cuda:0'
+batch_size = 180
+n_epochs = 5_000
+epoch_len = int(256 / 180 * 64) + 1  # 64
 r = 3e-5
 
 # model params
 model_params = dict(
     input_channels=3,
-    n_hid=64,
+    n_hid=128,
     n_downsamples=3,
-    n_bottlenecks=3,
-    codebook_size=256,
-    code_size=64,
+    n_bottlenecks=5,
+    code_size=1024,
+
+    codebook_size=128,
 )
 
 # optimizer params
@@ -43,7 +47,7 @@ lr = 1e-4
 
 # save params
 saveroot = './snapshots'
-savedir = f'train_orig_cs{model_params["codebook_size"]}'
+savedir = f'baselines_with_big_enc_dec/train_orig_cs{model_params["codebook_size"]}'
 savename = 'snapshot.tar'
 savepath = os.path.join(saveroot, savedir, savename)
 
@@ -267,6 +271,7 @@ def save_snapshot(model, metrics, savepath):
 
 def main():
     seed_everything(seed)
+    print(model_params)
 
     try:
         os.makedirs(os.path.join(saveroot, savedir))
